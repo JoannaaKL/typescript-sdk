@@ -202,4 +202,58 @@ describe('StdioClientTransport using cross-spawn', () => {
             );
         });
     });
+
+    describe('detached (process group)', () => {
+        const originalPlatform = process.platform;
+
+        afterEach(() => {
+            Object.defineProperty(process, 'platform', {
+                value: originalPlatform
+            });
+        });
+
+        // On POSIX the child must lead its own process group so the whole tree
+        // can be signaled via the negative PID in close(); see killProcessTree.
+        test('should set detached to true on non-Windows', async () => {
+            Object.defineProperty(process, 'platform', {
+                value: 'linux'
+            });
+
+            const transport = new StdioClientTransport({
+                command: 'test-command'
+            });
+
+            await transport.start();
+
+            expect(mockSpawn).toHaveBeenCalledWith(
+                'test-command',
+                [],
+                expect.objectContaining({
+                    detached: true
+                })
+            );
+        });
+
+        // On Windows detached is intentionally off: it breaks stdio redirection
+        // for wrapper commands like npx, and the tree is reaped with taskkill /T.
+        test('should set detached to false on Windows', async () => {
+            Object.defineProperty(process, 'platform', {
+                value: 'win32'
+            });
+
+            const transport = new StdioClientTransport({
+                command: 'test-command'
+            });
+
+            await transport.start();
+
+            expect(mockSpawn).toHaveBeenCalledWith(
+                'test-command',
+                [],
+                expect.objectContaining({
+                    detached: false
+                })
+            );
+        });
+    });
 });

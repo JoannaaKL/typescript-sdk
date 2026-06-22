@@ -1,4 +1,5 @@
 import type { ChildProcess, IOType } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import process from 'node:process';
 import type { Stream } from 'node:stream';
 import { PassThrough } from 'node:stream';
@@ -94,6 +95,75 @@ export function getDefaultEnvironment(): Record<string, string> {
 }
 
 /**
+ * Terminate a spawned child process together with all of its descendants.
+ *
+ * MCP servers are frequently launched through a wrapper command (`npx`, `uvx`,
+ * `python -m`, a shell script, …) that forks the real server as its own child.
+ * Signaling only the direct child — as {@linkcode ChildProcess.kill} does —
+ * leaves those descendants running as orphans. This helper signals the whole
+ * tree:
+ *
+ * - **POSIX**: the child is spawned with `detached: true`, so it leads its own
+ *   process group whose id equals its pid. `process.kill(-pid, signal)` delivers
+ *   `signal` to every member of that group atomically, including descendants
+ *   whose immediate parent has already exited.
+ * - **Windows**: there is no process-group signaling, so `taskkill /T /F` walks
+ *   and terminates the tree by pid. `/F` is always a forced kill, which matches
+ *   Node's existing Windows behavior (`ChildProcess.kill()` maps to
+ *   `TerminateProcess` regardless of the signal); the `signal` argument
+ *   therefore only affects POSIX.
+ *
+ * Any failure — most commonly the tree already being gone — falls back to a
+ * direct {@linkcode ChildProcess.kill} and is otherwise swallowed: `close()` is
+ * best-effort and must never reject because cleanup raced with a natural exit.
+ * The returned promise never rejects.
+ */
+function killProcessTree(childProcess: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): Promise<void> {
+    const pid = childProcess.pid;
+
+    // Without a pid we cannot address the group/tree; signal the handle directly.
+    if (pid === undefined) {
+        try {
+            childProcess.kill(signal);
+        } catch {
+            // ignore — the process is already gone
+        }
+        return Promise.resolve();
+    }
+
+    if (process.platform === 'win32') {
+        return new Promise<void>(resolve => {
+            execFile('taskkill', ['/T', '/F', '/PID', String(pid)], { windowsHide: true }, error => {
+                if (error) {
+                    // taskkill failed (e.g. the tree already exited); fall back to
+                    // a direct kill so a still-running direct child is reaped.
+                    try {
+                        childProcess.kill(signal);
+                    } catch {
+                        // ignore — the process is already gone
+                    }
+                }
+                resolve();
+            });
+        });
+    }
+
+    // POSIX: the negative pid targets the entire process group led by the child.
+    try {
+        process.kill(-pid, signal);
+    } catch {
+        // The group may already be gone, or we may lack permission to signal
+        // every member; fall back to signaling just the direct child.
+        try {
+            childProcess.kill(signal);
+        } catch {
+            // ignore — the process is already gone
+        }
+    }
+    return Promise.resolve();
+}
+
+/**
  * Client transport for stdio: this will connect to a server by spawning a process and communicating with it over stdin/stdout.
  *
  * This transport is only available in Node.js environments.
@@ -135,6 +205,14 @@ export class StdioClientTransport implements Transport {
                 },
                 stdio: ['pipe', 'pipe', this._serverParams.stderr ?? 'inherit'],
                 shell: false,
+                // Spawn the child in its own process group on POSIX so the whole
+                // tree (e.g. `npx`/`uvx`/`python -m` wrappers and their server
+                // children) can be signaled at once via the negative PID in
+                // `close()`. On Windows this is intentionally left off: `detached`
+                // there breaks stdio redirection for wrapper commands such as
+                // `npx` (see git history), and the process tree is reaped with
+                // `taskkill /T` instead.
+                detached: process.platform !== 'win32',
                 windowsHide: process.platform === 'win32',
                 cwd: this._serverParams.cwd
             });
@@ -236,21 +314,16 @@ export class StdioClientTransport implements Transport {
             await Promise.race([closePromise, new Promise(resolve => setTimeout(resolve, 2000).unref())]);
 
             if (processToClose.exitCode === null) {
-                try {
-                    processToClose.kill('SIGTERM');
-                } catch {
-                    // ignore
-                }
+                // Graceful: signal the whole process tree with SIGTERM and give
+                // it a chance to shut down before escalating.
+                await killProcessTree(processToClose, 'SIGTERM');
 
                 await Promise.race([closePromise, new Promise(resolve => setTimeout(resolve, 2000).unref())]);
             }
 
             if (processToClose.exitCode === null) {
-                try {
-                    processToClose.kill('SIGKILL');
-                } catch {
-                    // ignore
-                }
+                // Forceful: the tree ignored SIGTERM, so SIGKILL it.
+                await killProcessTree(processToClose, 'SIGKILL');
             }
         }
 

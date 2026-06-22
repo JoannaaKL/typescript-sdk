@@ -342,6 +342,16 @@ open-ended `protocolVersion >= '2025-11-25'` comparison, so an unrecognized futu
 The check is now bounded: the version must be one of the transport's supported protocol versions (after `connect()`, the server's `supportedProtocolVersions`) **and** at least `2025-11-25`. Behavior for all currently supported protocol versions (`2024-10-07` through
 `2025-11-25`) is unchanged. Clients claiming an unknown future protocol version in the initialize body are now treated like clients without empty-SSE-data support: no priming event is sent and no early-close callbacks are provided.
 
+### `StdioClientTransport.close()` terminates the whole process tree
+
+`StdioClientTransport.close()` now terminates the spawned server **and all of its descendants**, not just the direct child process. Previously, when a server was launched through a wrapper command (`npx`, `uvx`, `python -m`, a shell script, …), `close()` signaled only the wrapper; the underlying server it had forked was left running as an orphan.
+
+To make this possible the child is now spawned in its own process group on POSIX (`detached: true`), and `close()` signals the group via the negative PID (`SIGTERM`, then `SIGKILL` after a grace period). On Windows the tree is reaped with `taskkill /T /F`; `detached` stays off there because it breaks stdio redirection for wrapper commands.
+
+Most consumers need no changes — orphaned server processes simply stop leaking. There is one behavioral consequence to be aware of on **POSIX**:
+
+- Because the child now leads its own process group, a Ctrl-C (`SIGINT`) delivered to your terminal is **no longer auto-forwarded** to the server by the OS. If you relied on that implicit propagation for cleanup, call `transport.close()` (or `client.close()`) explicitly from your own shutdown path — for example in a `SIGINT`/`SIGTERM` handler. This is already the recommended way to shut a transport down, and matches how the MCP Python SDK manages stdio servers.
+
 ### `setRequestHandler` and `setNotificationHandler` use method strings
 
 The low-level `setRequestHandler` and `setNotificationHandler` methods on `Client`, `Server`, and `Protocol` now take a method string instead of a Zod schema.

@@ -509,6 +509,8 @@ NOT removed (wire surface, kept for 2025-11-25 interop): task Zod schemas + infe
 
 `Client.listPrompts()`, `listResources()`, `listResourceTemplates()`, `listTools()` now return empty results when the server lacks the corresponding capability (instead of sending the request). Set `enforceStrictCapabilities: true` in `ClientOptions` to throw an error instead.
 
+`StdioClientTransport.close()` now terminates the spawned server **and its entire process tree**, not just the direct child. Servers launched via a wrapper (`npx`, `uvx`, `python -m`, shell scripts) no longer leave orphaned processes behind. No code change required. POSIX-only caveat: the child is spawned `detached` (own process group), so terminal `SIGINT` (Ctrl-C) is no longer auto-forwarded to it by the OS — call `transport.close()` / `client.close()` from your own shutdown handler if you relied on that.
+
 ### Server (Streamable HTTP transport)
 
 No code changes required; these are wire-behavior notes:
